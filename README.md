@@ -46,36 +46,6 @@ for chunk in resp:
     print(chunk.choices[0].delta.content, end="")
 ```
 
-### opencode 接入
-
-在 `~/.config/opencode/opencode.json` 增加自定义 provider（模型名 `human-proxy/deepseek-chat`），随后 `opencode -m human-proxy/deepseek-chat` 启动：
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "human-proxy": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "能工智人 (Human Proxy)",
-      "options": {
-        "baseURL": "http://127.0.0.1:11451/v1",
-        "apiKey": "human-proxy-local"
-      },
-      "models": {
-        "deepseek-chat": {
-          "name": "DeepSeek Chat (人工)",
-          "tool_call": false,
-          "reasoning": false,
-          "attachment": false,
-          "limit": { "context": 128000, "output": 8000 },
-          "cost": { "input": 0, "output": 0 }
-        }
-      }
-    }
-  }
-}
-```
-
 ## API 端点
 
 | 方法 | 路径 | 说明 |
@@ -104,3 +74,5 @@ for chunk in resp:
 ## 许可证
 
 [MIT](./LICENSE) © qingyingge
+
+本项目的代码由 opencode 与 DeepSeek 生成。
