@@ -1,0 +1,7 @@
+# 能工智人 (AI-Human Proxy) 依赖
+# 安装: pip install -r requirements.txt
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+# 分词器: transformers 会连带安装 torch, 体积较大; 本项目仅用其编码/解码
+transformers>=4.44.0
