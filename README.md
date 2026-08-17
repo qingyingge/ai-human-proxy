@@ -75,4 +75,4 @@ for chunk in resp:
 
 [MIT](./LICENSE) © qingyingge
 
-本项目的代码由 opencode 与 DeepSeek 生成。
+本项目的代码由 OpenCode 与 DeepSeek 生成。
