@@ -357,7 +357,12 @@ function renderMarkdown(src) {
 function inline(s) {
   // 链接 [text](url) 与代码 `code`
   s = s.replace(/`([^`]+)`/g, (m, c) => `<code>${c}</code>`);
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, t, u) => `<a href="${u}" target="_blank" rel="noopener">${t}</a>`);
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, t, u) => {
+    if (/^(https?:|mailto:)/i.test(u)) {
+      return `<a href="${u}" target="_blank" rel="noopener">${t}</a>`;
+    }
+    return t;
+  });
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
   return s;
@@ -383,7 +388,7 @@ function appendMsg(role, content, opts = {}) {
   body.appendChild(contentDiv);
   div.appendChild(badge);
   div.appendChild(body);
-  flowEl.appendChild(div);
+  (opts.target || flowEl).appendChild(div);
   scrollBottom();
 }
 
@@ -440,10 +445,11 @@ function collapseOlderRounds() {
 
 function sendDelta(text) {
   if (!text || !busy || !ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: 'delta', content: text }));
+  ws.send(JSON.stringify({ type: 'delta', content: text, request_id: currentRequestId }));
 }
 
 function finishCurrent(notifyServer) {
+  const rid = currentRequestId;
   busy = false;
   currentRequestId = null;
   currentPromptTokens = 0;
@@ -453,9 +459,9 @@ function finishCurrent(notifyServer) {
   stopBtn.classList.remove('waiting');
   genEl.classList.remove('active');
   tokbar.classList.remove('show');
-  tokbar.querySelectorAll('.tok').forEach(b => b.classList.remove('disabled'));
+  renderTokbar();
   if (notifyServer && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'stop' }));
+    ws.send(JSON.stringify({ type: 'stop', request_id: rid }));
   }
   const text = genEl.value;
   genEl.value = '';
@@ -500,8 +506,9 @@ function handleServer(msg) {
   placeholderEl.classList.add('hidden');
   const { body } = appendRoundCard({ round, msgCount: (msg.messages || []).length });
   for (const m of msg.messages || []) {
-    appendMsg(m.role || 'user', m.content, { raw: false });
+    appendMsg(m.role || 'user', m.content, { raw: false, target: body });
   }
+  renderTokbar();
   const meta = document.createElement('div');
   meta.className = 'meta';
   const tk = document.createElement('span');
@@ -527,6 +534,9 @@ function renderTokbar() {
     b.addEventListener('click', () => {
       if (!busy) return;
       sendDelta(t);
+      genEl.value += t;
+      genEl.style.height = 'auto';
+      genEl.style.height = genEl.scrollHeight + 'px';
       toast('已插入 ' + t, 1000);
       genEl.focus();
       lockCaret();
@@ -573,14 +583,20 @@ genEl.addEventListener('keydown', (e) => {
   if (e.key === 'Backspace') return;
   lockCaret();
   scrollBottom();
-  if (!busy || composing || e.isComposing) return;
+  if (!busy) { e.preventDefault(); return; }
+  if (composing || e.isComposing) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === 'Tab') { e.preventDefault(); return; }
   if (e.key === 'Enter') { sendDelta('\n'); return; }
-  if (e.key.length === 1) sendDelta(e.key);
+  if (e.key.length === 1 || e.key.codePointAt(0) > 0xFFFF) sendDelta(e.key);
 });
 
 genEl.addEventListener('input', () => {
+  if (!busy) {
+    genEl.value = '';
+    genEl.style.height = 'auto';
+    return;
+  }
   genEl.style.height = 'auto';
   genEl.style.height = genEl.scrollHeight + 'px';
   refreshWaiting();
@@ -597,6 +613,7 @@ document.addEventListener('click', (e) => {
 });
 
 genEl.addEventListener('paste', (e) => {
+  if (!busy) { e.preventDefault(); return; }
   const text = (e.clipboardData || window.clipboardData).getData('text');
   if (text) sendDelta(text);
 });

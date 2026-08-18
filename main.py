@@ -23,12 +23,14 @@ import os
 import secrets
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from typing import Any, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 HOST = "127.0.0.1"
 PORT = 11451
@@ -37,7 +39,28 @@ HEARTBEAT_SECONDS = 3          # 非流式: 每 3 秒发送一个换行符保持
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app = FastAPI(title="能工智人 (AI-Human Proxy)")
+# 后台清理任务(僵尸会话兜底)
+async def _sweeper():
+    while True:
+        await asyncio.sleep(10)
+        now = time.time()
+        for s in list(pending_sessions):
+            if s.finished:
+                continue
+            # 生成器从未被消费(客户端断开)且已过截止时间 -> 直接终结, 防队首永久阻塞
+            if not s.consumer_started and now > s.deadline:
+                s.timed_out = True
+                mark_done(s)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = asyncio.create_task(_sweeper())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="能工智人 (AI-Human Proxy)", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # 分词器: 仅加载 DeepSeek-V3 开源词表用于 token 计数, 不加载模型权重。
@@ -47,11 +70,11 @@ TOKENIZER = None
 LOCAL_TOKENIZER_PATH = os.path.join(BASE_DIR, "tokenizer", "deepseek-v3")
 
 
-def _load_tokenizer(source: str, local_only: bool = False):
+def _load_tokenizer(source: str, local_only: bool = False, trust_remote_code: bool = True):
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
-        source, trust_remote_code=True, local_files_only=local_only
+        source, trust_remote_code=trust_remote_code, local_files_only=local_only
     )
 
 
@@ -69,7 +92,9 @@ def _extract_special_tokens(tok) -> list:
 try:
     # 1. 优先加载本地词表 (离线可用, 见 tokenizer/deepseek-v3/)
     if os.path.isdir(LOCAL_TOKENIZER_PATH):
-        TOKENIZER = _load_tokenizer(LOCAL_TOKENIZER_PATH, local_only=True)
+        TOKENIZER = _load_tokenizer(
+            LOCAL_TOKENIZER_PATH, local_only=True, trust_remote_code=False
+        )
         print("[能工智人] DeepSeek-V3 tokenizer 加载完成 (本地)")
     else:
         raise FileNotFoundError("本地词表不存在")
@@ -81,8 +106,17 @@ except Exception as exc:
         print("[能工智人] DeepSeek-V3 tokenizer 加载完成")
     except Exception as exc2:
         # 3. 回退 hf-mirror.com 镜像
+        # 注意: huggingface_hub 的 ENDPOINT 在 import 时固化, 需同时刷新常量
         print(f"[能工智人] 直连加载失败({exc2}), 尝试 hf-mirror.com 镜像...")
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        try:
+            import importlib
+
+            import huggingface_hub.constants as _hf_constants
+
+            importlib.reload(_hf_constants)
+        except Exception:
+            pass
         try:
             TOKENIZER = _load_tokenizer("deepseek-ai/DeepSeek-V3")
             print("[能工智人] DeepSeek-V3 tokenizer 加载完成 (hf-mirror.com)")
@@ -114,7 +148,7 @@ class ChatCompletionStreamOptions(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str = "gpt-4"
-    messages: List[ChatMessage] = []
+    messages: List[ChatMessage] = Field(default_factory=list, min_length=1)
     stream: bool = False
     max_tokens: Optional[int] = None              # 官方已标记 deprecated
     max_completion_tokens: Optional[int] = None   # 官方推荐字段, 兜底展示
@@ -132,7 +166,7 @@ class HumanSession:
         self.messages = request.messages
         self.stream = request.stream
         # max_tokens 已废弃, 优先取 max_completion_tokens 用于 UI 展示提醒
-        self.max_tokens = request.max_tokens or request.max_completion_tokens
+        self.max_tokens = request.max_completion_tokens or request.max_tokens
         self.include_usage = bool(
             request.stream_options and request.stream_options.include_usage
         )
@@ -145,6 +179,9 @@ class HumanSession:
         self.parts: List[str] = []                         # 累计增量文本
         self.finished = False
         self.timed_out = False
+        self.consumer_started = False                      # 生成器是否已被客户端消费
+        self.completion_tokens = 0                         # 实时增量 token 计数
+        self.last_usage_ts = 0.0                           # usage 广播节流时间戳
 
         self.prompt_text = build_prompt_text(request.messages)
         self.prompt_tokens = count_tokens(self.prompt_text)
@@ -201,6 +238,16 @@ async def broadcast(payload: dict):
             ui_clients.discard(ws)
 
 
+# 保存后台广播任务的引用, 避免任务被 GC 而未执行
+_bg_tasks: set = set()
+
+
+def _spawn_broadcast(payload: dict):
+    task = asyncio.create_task(broadcast(payload))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 def mark_done(s: HumanSession):
     """会话终结: 出队, 提升下一个排队会话并通知 UI。"""
     if s.finished:
@@ -211,19 +258,33 @@ def mark_done(s: HumanSession):
     nxt = active_session()
     if nxt is not None and not nxt.active_event.is_set():
         nxt.active_event.set()
-        asyncio.create_task(broadcast(session_payload(nxt)))
+        _spawn_broadcast(session_payload(nxt))
 
 
-def error_body(message: str) -> dict:
-    # 官方 Error 四字段全 required: type/message/param/code
-    return {"error": {"message": message, "type": "server_error",
-                      "param": None, "code": 504}}
+def error_body(message: str, error_type: str = "server_error",
+               code: Optional[str] = None) -> dict:
+    # 官方 Error 四字段全 required: type/message/param/code, code 为 string|null
+    return {"error": {"message": message, "type": error_type,
+                      "param": None, "code": code}}
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError):
+    """pydantic 校验失败 -> 统一 OpenAI 四字段错误格式。"""
+    detail = json.dumps(exc.errors(), ensure_ascii=False)
+    return JSONResponse(
+        status_code=422,
+        content=error_body("请求参数校验失败: " + detail,
+                           error_type="invalid_request_error",
+                           code="invalid_request_error"),
+    )
 
 
 def sse_error_event(message: str) -> str:
     # 官方 ErrorEvent: event: error + data: Error
     return ("event: error\n"
-            + "data: " + json.dumps(error_body(message), ensure_ascii=False)
+            + "data: " + json.dumps(
+                error_body(message, code="server_error"), ensure_ascii=False)
             + "\n\n")
 
 
@@ -247,6 +308,7 @@ def sse_line(obj: dict) -> str:
 # ---------------------------------------------------------------------------
 async def stream_response(s: HumanSession):
     try:
+        s.consumer_started = True
         # 等待轮到本会话 (排队中的请求先不发任何块)
         try:
             await asyncio.wait_for(
@@ -272,27 +334,29 @@ async def stream_response(s: HumanSession):
         # 2. 中间块: 原样透传 UI 增量 (不拆字, 不做 token 计数)
         # 同时监听"新增量"与"停止", 避免 stop 后仍阻塞在队列等待上
         stop_waiter = asyncio.create_task(s.stop_event.wait())
-        while True:
-            if s.stop_event.is_set() and s.delta_queue.empty():
-                break
-            remaining = s.deadline - time.time()
-            if remaining <= 0:
-                s.timed_out = True
-                break
-            get_task = asyncio.create_task(s.delta_queue.get())
-            done, _ = await asyncio.wait(
-                {get_task, stop_waiter}, timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:  # 人类 120 秒未停止
-                get_task.cancel()
-                s.timed_out = True
-                break
-            if stop_waiter in done:
-                # 停止已到: 若队列还有未发完的增量, 先发完再结束
-                get_task.cancel()
-                if not s.delta_queue.empty():
-                    delta = await s.delta_queue.get()
+        get_task = None
+        try:
+            while True:
+                if s.stop_event.is_set() and s.delta_queue.empty():
+                    break
+                remaining = s.deadline - time.time()
+                if remaining <= 0:
+                    s.timed_out = True
+                    break
+                get_task = asyncio.create_task(s.delta_queue.get())
+                done, _ = await asyncio.wait(
+                    {get_task, stop_waiter}, timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:  # 人类 120 秒未停止
+                    get_task.cancel()
+                    get_task = None
+                    s.timed_out = True
+                    break
+                if get_task in done:
+                    # 先消费已取出的增量, 避免与 stop 同时完成时丢块
+                    delta = get_task.result()
+                    get_task = None
                     yield sse_line({
                         "id": s.request_id,
                         "object": "chat.completion.chunk",
@@ -302,18 +366,17 @@ async def stream_response(s: HumanSession):
                                      "finish_reason": None}],
                         **({"usage": None} if s.include_usage else {}),
                     })
+                if stop_waiter in done:
+                    if get_task is not None:
+                        get_task.cancel()
+                        get_task = None
+                    if s.delta_queue.empty():
+                        break
                     continue
-                break
-            delta = get_task.result()
-            yield sse_line({
-                "id": s.request_id,
-                "object": "chat.completion.chunk",
-                "created": s.created,
-                "model": s.model,
-                "choices": [{"index": 0, "delta": {"content": delta},
-                             "finish_reason": None}],
-                **({"usage": None} if s.include_usage else {}),
-            })
+        finally:
+            stop_waiter.cancel()
+            if get_task is not None:
+                get_task.cancel()
 
         if s.timed_out:
             # SSE 头部已发出无法改状态码, 以官方 ErrorEvent + [DONE] 结束
@@ -352,6 +415,7 @@ async def stream_response(s: HumanSession):
 # ---------------------------------------------------------------------------
 async def non_stream_response(s: HumanSession):
     try:
+        s.consumer_started = True
         # 等待轮到本会话, 期间持续发送换行心跳保持 TCP 活跃
         while not s.active_event.is_set():
             try:
@@ -377,7 +441,8 @@ async def non_stream_response(s: HumanSession):
         if s.timed_out:
             # 注: 心跳需要先行发出响应, 故超时时无法再改 HTTP 状态码,
             # 这里返回与规范一致的 504 错误 JSON 体。
-            yield json.dumps(error_body("Inference timeout"), ensure_ascii=False)
+            yield json.dumps(error_body("Inference timeout", code="server_error"),
+                             ensure_ascii=False)
         else:
             usage, content = compute_usage(s)
             yield json.dumps({
@@ -442,22 +507,43 @@ async def human_console(ws: WebSocket):
         await ws.send_json(session_payload(cur))
     try:
         while True:
-            msg = await ws.receive_json()
+            try:
+                msg = await ws.receive_json()
+            except Exception:
+                # 非 JSON / 非 dict 消息不应踢掉控制台连接
+                try:
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "仅接受 JSON 对象消息",
+                    })
+                except Exception:
+                    break
+                continue
+            if not isinstance(msg, dict):
+                continue
             mtype = msg.get("type")
             s = active_session()
             if s is None or s.finished:
+                continue
+            # 携带 request_id 时校验归属, 防止上一轮残留消息污染新会话
+            rid = msg.get("request_id")
+            if rid is not None and rid != s.request_id:
                 continue
             if mtype == "delta":
                 content = str(msg.get("content", ""))
                 if content:
                     s.parts.append(content)
                     await s.delta_queue.put(content)
-                    # 推送实时 token 计数, 供 UI 显示分词器的作用
-                    await broadcast({
-                        "type": "usage",
-                        "request_id": s.request_id,
-                        "completion_tokens": count_tokens("".join(s.parts)),
-                    })
+                    # 推送实时 token 计数 (增量累加 + 节流, 避免每键全量重编码)
+                    s.completion_tokens += count_tokens(content)
+                    now = time.time()
+                    if now - s.last_usage_ts >= 0.3:
+                        s.last_usage_ts = now
+                        _spawn_broadcast({
+                            "type": "usage",
+                            "request_id": s.request_id,
+                            "completion_tokens": s.completion_tokens,
+                        })
             elif mtype == "stop":
                 s.stop_event.set()
     except WebSocketDisconnect:
